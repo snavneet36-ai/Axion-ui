@@ -8,10 +8,12 @@ pool:
   name: agent-VM-wala
 
 stages:
+  # Stage 1: Build frontend
   - stage: Build
     displayName: Build Axion UI
     jobs:
       - job: BuildFrontend
+        displayName: Build React Application
         steps:
           - checkout: self
 
@@ -36,3 +38,101 @@ stages:
               targetPath: dist
               artifact: axion-ui-dist
               publishLocation: pipeline
+
+  # Stage 2: Deploy to application VM
+  - stage: Deploy
+    displayName: Deploy Axion UI
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: DeployFrontend
+        displayName: Deploy to Ubuntu VM
+        steps:
+          - checkout: none
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download build artifact
+            inputs:
+              buildType: current
+              artifactName: axion-ui-dist
+              targetPath: '$(Pipeline.Workspace)/axion-ui-dist'
+
+          - script: |
+              set -euo pipefail
+
+              KEY="/home/adminuser/.ssh/axion-deploy"
+              HOST="172.16.0.4"
+              USER="azureuser"
+              ARTIFACT="$(Pipeline.Workspace)/axion-ui-dist"
+
+              test -f "$KEY"
+              test -f "$ARTIFACT/index.html"
+
+              chmod 600 "$KEY"
+
+              # Prepare a temporary deployment directory
+              ssh -i "$KEY" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "$USER@$HOST" \
+                'mkdir -p "$HOME/axion-ui-deploy"'
+
+              # Transfer the built frontend
+              scp -i "$KEY" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                -r "$ARTIFACT/." \
+                "$USER@$HOST:axion-ui-deploy/"
+
+              # Configure Nginx and publish the files
+              ssh -i "$KEY" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "$USER@$HOST" 'bash -s' <<'REMOTE_SCRIPT'
+              set -euo pipefail
+
+              sudo apt-get update -y
+              sudo apt-get install -y nginx
+
+              sudo mkdir -p /var/www/axion-ui
+              sudo cp -a "$HOME/axion-ui-deploy/." /var/www/axion-ui/
+              sudo chown -R www-data:www-data /var/www/axion-ui
+
+              sudo tee /etc/nginx/sites-available/axion-ui >/dev/null <<'NGINX_CONFIG'
+              server {
+                  listen 80 default_server;
+                  listen [::]:80 default_server;
+
+                  server_name _;
+
+                  root /var/www/axion-ui;
+                  index index.html;
+
+                  location / {
+                      try_files $uri $uri/ /index.html;
+                  }
+              }
+              NGINX_CONFIG
+
+              sudo ln -sfn /etc/nginx/sites-available/axion-ui \
+                /etc/nginx/sites-enabled/axion-ui
+
+              sudo rm -f /etc/nginx/sites-enabled/default
+              sudo nginx -t
+              sudo systemctl enable --now nginx
+              sudo systemctl reload nginx
+              REMOTE_SCRIPT
+
+              # Verify the deployed application responds
+              for attempt in $(seq 1 10); do
+                if curl --fail --silent --show-error \
+                  --output /dev/null "http://$HOST/"; then
+                  echo "Axion UI deployment and HTTP health check succeeded."
+                  exit 0
+                fi
+                sleep 3
+              done
+
+              echo "Deployment health check failed."
+              exit 1
+            displayName: Deploy files and configure Nginx
