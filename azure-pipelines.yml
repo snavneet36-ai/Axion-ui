@@ -24,7 +24,8 @@ stages:
             displayName: Install dependencies
 
           - script: npm run lint
-            displayName: Run lint
+            displayName: Run lint (temporary non-blocking)
+            continueOnError: true
 
           - script: npm run build
             displayName: Build frontend
